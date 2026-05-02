@@ -1,0 +1,249 @@
+\documentclass[12pt,a4paper]{article}
+
+% Paquetes básicos
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{tikz}
+\usetikzlibrary{shapes, arrows.meta, positioning, calc}
+
+\geometry{left=2.5cm, right=2.5cm, top=2.5cm, bottom=2.5cm}
+
+\title{\textbf{Parcial II Corte - Matemáticas Computacionales} \\ Detección de anomalías en tráfico de red mediante modelos de espacio de estados y análisis espectral}
+\author{ integrantes:\\ 
+    Jose Daniel Castro Villadiego \\ 
+    Michael Andrés Padilla Carabali \\ 
+    Samuel Castillo Julio \\ 
+    Santiago de Jesús Trejos Zuluaga \\ 
+    Yeiner Jesús Hernández Bustos \\ 
+    Yordi Romario Jiménez López \\~\\
+    \textit{Programa de Ingeniería de Sistemas} \\ 
+    \textit{Docente: Udualdo Herrera PhD (c)}
+}
+\date{Abril 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+Este documento técnico presenta la derivación matemática, diseño arquitectónico y evaluación de un sistema híbrido para la detección de anomalías en tráfico de red. El modelo integra un mecanismo de Estado Espacio de Estado Selectivo (SSM) para dependencias temporales de largo plazo, un bloque espectral para extraer periodicidades, y un Filtro de Kalman escalar como post-procesamiento para suavizar las predicciones, evaluado sobre el dataset UNSW-NB15.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Entendimiento Matemático y Formulación (Bloque 1)}
+
+\subsection{Modelado en el dominio temporal}
+
+Partiendo del sistema dinámico lineal en tiempo continuo:
+\begin{align}
+x'(t) &= A_c x(t) + B_c u(t) \label{eq:cont1} \\
+y(t) &= C x(t) + D u(t) \label{eq:cont2}
+\end{align}
+
+\textbf{Discretización ZOH (Zero-Order Hold):}\\
+Asumiendo que la entrada $u(t)$ se mantiene constante durante un intervalo de muestreo $\Delta t$ ($u(t) = u_k$ para $t \in [k\Delta t, (k+1)\Delta t)$), la solución de la ecuación diferencial es:
+\begin{equation}
+x_{k+1} = e^{A_c \Delta t} x_k + \int_{0}^{\Delta t} e^{A_c (\Delta t - \tau)} B_c d\tau \cdot u_k
+\end{equation}
+Por lo tanto, las matrices discretizadas por ZOH son $\bar{A} = e^{A_c \Delta t}$ y $\bar{B} = A_c^{-1}(e^{A_c \Delta t} - I)B_c$.
+
+\textbf{Aproximación de Euler:}\\
+Usando la expansión de Taylor de primer orden: $x(t+\Delta t) \approx x(t) + x'(t)\Delta t$. Sustituyendo \eqref{eq:cont1}:
+\begin{equation}
+x_{k+1} = x_k + (A_c x_k + B_c u_k)\Delta t = (I + A_c \Delta t)x_k + B_c \Delta t u_k
+\end{equation}
+Aquí, $\bar{A} = I + A_c \Delta t$ y $\bar{B} = B_c \Delta t$.
+
+\textbf{Estabilidad:}\\
+Si parametrizamos $A_c = -\text{diag}(\lambda_1, \dots, \lambda_N)$ con $\lambda_i > 0$, los valores propios de $A_c$ son reales y negativos, garantizando estabilidad asintótica en tiempo continuo. Para la forma discreta, la condición de estabilidad es que el espectro de la matriz discretizada caiga estrictamente dentro del círculo unitario ($|\text{eig}(\bar{A})| < 1$). Con ZOH, $|e^{-\lambda_i \Delta t}| < 1$ se cumple siempre. Con Euler, se requiere que $|1 - \lambda_i \Delta t| < 1$, imponiendo la restricción $\Delta t < 2/\max(\lambda_i)$.
+
+\textbf{Complejidad:}\\
+La recurrencia $x_k = \bar{A} x_{k-1} + \bar{B} u_k$ escala como $\mathcal{O}(L \cdot N)$, donde $L$ es la longitud de la secuencia y $N$ la dimensión del estado. Es lineal respecto a $L$, a diferencia de los Transformers ($\mathcal{O}(L^2)$).
+
+\textbf{Comparación con LSTM/GRU:}\\
+Las redes recurrentes tradicionales (LSTM, GRU) sufren del problema del desvanecimiento o explosión del gradiente porque la propagación hacia atrás implica multiplicaciones repetidas de la matriz Jacobiana del estado oculto, cuyos valores propios pueden ser $>1$ o $<1$. Nuestra formulación SSM evita esto garantizando analíticamente (mediante la parametrización diagonal negativa) que $|\text{eig}(\bar{A})| < 1$, controlando la memoria de forma matemáticamente estable.
+
+\subsection{Selección dependiente de la entrada}
+
+En la formulación clásica, los parámetros son fijos. Proponemos que $\Delta_t$, $B_t$ y $C_t$ se generen como proyecciones lineales de la entrada $u_t$:
+\begin{align}
+\Delta_t &= \text{softplus}(W_\Delta u_t) \\
+B_t &= W_B u_t \\
+C_t &= W_C u_t
+\end{align}
+
+\textbf{¿Qué gana el modelo?}\\
+El modelo gana un mecanismo de \textbf{selección}. Al hacer $B_t$ dependiente de $u_t$, el modelo puede "ignorar" entradas irrelevantes proyectándolas a cero. Al hacer $\Delta_t$ variable, puede decidir si "olvida" rápido ($\Delta_t \to 0$) o si "retiene" información a muy largo plazo ($\Delta_t \to \infty$). Esto es análogo a las puertas en las LSTMs, pero integrado en la dinámica del sistema de control.
+
+\subsection{Dominio Frecuencial}
+
+Definimos la Transformada de Fourier continua y su contraparte discreta (DFT):
+\begin{align}
+X(f) &= \int_{-\infty}^{+\infty} x(t) e^{-j 2\pi ft} dt \\
+X[k] &= \sum_{n=0}^{N-1} x[n] e^{-j 2\pi kn/N}, \quad k = 0, \dots, N-1
+\end{align}
+
+\textbf{Simetría conjugada:}\\
+Para una señal real de longitud $L$, se cumple que $X[k] = X^*[L-k]$. Esto significa que la segunda mitad de los coeficientes es el conjugado complejo de la primera mitad, siendo redundante. Por tanto, basta calcular $L/2+1$ coeficientes complejos usando la DFT real (rfft), ahorrando la mitad del cómputo.
+
+\textbf{Mecanismo de extracción de features espectrales:}
+\begin{enumerate}
+    \item[(a)] Calcular la DFT a lo largo del eje temporal: $\tilde{X} = \text{rfft}(x)$     \item[(b)] Crear una máscara $M$ reteniendo solo las $K$ componentes de mayor magnitud: $M_k = 1$ si $|\tilde{X}_k|$ está en el Top-K, sino $0$.
+    \item[(c)] Aplicar un filtro complejo aprendible por canal $W_f \in \mathbb{C}^D$: $\hat{X} = (\tilde{X} \odot M) \odot W_f$     \item[(d)] Devolver al dominio temporal mediante la transformada inversa: $x_{freq} = \text{irfft}(\hat{X})$ \end{enumerate}
+
+\subsection{Fusión Ponderada}
+
+Proponemos la fusión:
+\begin{equation}
+z_t = \alpha \odot x_t + \beta \odot X(f)
+\end{equation}
+
+\begin{itemize}
+    \item \textbf{¿Por qué producto elemento a elemento ($\odot$) y no un escalar?} Un escalar obligaría a toda la representación vectorial a ponderar de la misma forma las ramas temporal y frecuencial. El producto elemento a elemento permite que cada dimensión (feature) decida independientemente si la información proviene más de la evolución temporal o del patrón periódico.
+    \item \textbf{Rol de la inicialización:} Si inicializamos $\alpha \approx 1$ y $\beta \approx 0$, el modelo comienza comportándose como un SSM puro, garantizando estabilidad inicial, y gradualmente aprende a usar la rama frecuencial a medida que el gradiente actualiza $\beta$.
+    \item \textbf{¿Qué pasaría si $\alpha = \beta = 1$?} Las representaciones se sumarían directamente sin ponderación. Esto podría causar conflictos de escala entre dominios y el modelo no podría "apagar" una rama si una de ellas genera ruido en un momento dado.
+\end{itemize}
+
+\subsection{Arquitectura}
+
+El diagrama completo del modelo se ilustra en la Figura \ref{fig:arquitectura}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+    node distance=1.5cm,
+    block/.style={rectangle, draw, fill=blue!10, text width=3.5cm, text centered, rounded corners, minimum height=1.5cm},
+    arrow/.style={-{Stealth[scale=1.2]}, thick}
+]
+
+\node (input) {Entrada $u_t$};
+\node[block, right=of input] (proj) {Proyección Lineal};
+\node[block, above right=1cm and 2cm of proj] (temporal) {TemporalBlock\\(SSM + Conv + SiLU)};
+\node[block, below right=1cm and 2cm of proj] (spectral) {SpectralBlock\\(rfft + Top-K + irfft)};
+\node[block, right=3.5cm of proj] (fusion) {Fusión $\alpha \odot x + \beta \odot X(f)$};
+\node[block, right=of fusion] (decoder) {Decoder (Linear)};
+\node[right=of decoder] (output) {Logits};
+
+\draw[arrow] (input) -- (proj);
+\draw[arrow] (proj) |- (temporal);
+\draw[arrow] (proj) |- (spectral);
+\draw[arrow] (temporal) -| (fusion);
+\draw[arrow] (spectral) -| (fusion);
+\draw[arrow] (fusion) -- (decoder);
+\draw[arrow] (decoder) -- (output);
+
+\end{tikzpicture}
+\caption{Diagrama de Arquitectura del AnomalyDetector.}
+\label{fig:arquitectura}
+\end{figure}
+
+\textbf{¿Por qué la rama frecuencial en paralelo y no en serie?}\\
+Si estuviera en serie, la representación temporal sufriría una transformación no lineal antes de llegar a la rama frecuencial, distorsionando las periodicidades puras de la señal original. Al estar en paralelo, el bloque espectral opera sobre la señal "limpia" recién proyectada, extrayendo características cíclicas auténticas, mientras que el bloque temporal captura las transiciones, fusionándose solo al final.
+
+\subsection{Hiperparámetros}
+
+Listado de hiperparámetros clasificados:
+
+\begin{itemize}
+    \item \textbf{(i) Capacidad del modelo:}
+    \begin{itemize}
+        \item $N$ (dimensión del estado SSM, ej. 8): Determina la capacidad de memoria de largo plazo.
+        \item $D$ (dimensión del modelo, ej. 32): Capacidad de representación de features.
+        \item $K$ (Top-K frecuencial, ej. 5): Cuántas frecuencias predominantes se conservan.
+    \end{itemize}
+    \item \textbf{(ii) Estabilidad del entrenamiento:}
+    \begin{itemize}
+        \item $lr$ (Learning rate, ej. $10^{-3}$): Tamaño del paso de Adam.
+        \item $\lambda_{init}$ (Inicialización de A, ej. 0.5): Garantiza estabilidad numérica al inicio.
+        \item $max\_norm$ (Clip de gradiente, ej. 1.0): Evita explosión de gradiente.
+    \end{itemize}
+    \item \textbf{(iii) Costo computacional:}
+    \begin{itemize}
+        \item $L$ (Longitud de ventana, ej. 10): Afecta linealmente la recurrencia.
+        \item Batch size (ej. 32): Consumo de memoria GPU.
+    \end{itemize}
+\end{itemize}
+
+\subsection{Filtro de Kalman como post-procesamiento}
+
+El modelo produce $p_t \in [0,1]$. Formulamos el filtro con estado latente $s_t \in \mathbb{R}$:
+\begin{align}
+s_{t+1} &= s_t + w_t, \quad w_t \sim \mathcal{N}(0, \sigma_w^2) \label{eq:kalman_state} \\
+p_t &= s_t + v_t, \quad v_t \sim \mathcal{N}(0, \sigma_v^2) \label{eq:kalman_obs}
+\end{align}
+
+\textbf{Derivación de ecuaciones:}
+\begin{itemize}
+    \item \textbf{Predicción:} El estado evoluciona según \eqref{eq:kalman_state}.
+    $\hat{s}_{t|t-1} = \hat{s}_{t-1|t-1}$     $P_{t|t-1} = P_{t-1|t-1} + \sigma_w^2$     
+    \item \textbf{Ganancia de Kalman:} Minimiza el error cuadrático medio.
+    $K_t = \frac{P_{t|t-1}}{P_{t|t-1} + \sigma_v^2}$     
+    \item \textbf{Actualización:} Incorpora la observación $p_t$.
+    $\hat{s}_{t|t} = \hat{s}_{t|t-1} + K_t(p_t - \hat{s}_{t|t-1})$     $P_{t|t} = (1 - K_t)P_{t|t-1}$ \end{itemize}
+
+\textbf{Preguntas:}
+\begin{itemize}
+    \item Si $\sigma_w^2 \to 0$: El modelo confía en que el estado no cambia. $P_{t|t-1} \to 0$, por lo tanto $K_t \to 0$. Ignora las observaciones ruidosas y se queda con la predicción previa (suavizado agresivo).
+    \item Si $\sigma_w^2 \to \infty$: El modelo asume que el estado es muy volátil. $K_t \to 1$. Ignora su predicción previa y confía completamente en la nueva observación (seguimiento rápido).
+\end{itemize}
+
+%---------------------------------------------------------
+\newpage
+\section{Implementación y Entrenamiento (Bloque 2)}
+
+El modelo fue implementado en PyTorch conforme a la arquitectura descrita. El dataset UNSW-NB15 se procesó con ventaneo deslizante de longitud $L=10$, resultando en 42 características por paso temporal. Se aplicó balanceo de clases mediante SMOTE y undersampling, logrando un conjunto de entrenamiento de 90,664 ventanas balanceadas. 
+
+El entrenamiento se realizó durante 5 épocas con el optimizador Adam ($lr=10^{-3}$) y CrossEntropyLoss, alcanzando su mejor punto de validación en la época 4 con un Val F1 de 0.9326. La loss disminuyó monótonamente de 0.1037 a 0.0207, demostrando convergencia estable.
+
+%---------------------------------------------------------
+\newpage
+\section{Evaluación, Comparación y Análisis (Bloque 3)}
+
+\subsection{Métricas y Comparación}
+
+La Tabla \ref{tab:resultados} presenta las métricas evaluadas en el conjunto de test (175,341 registros originales) bajo las dos condiciones: Baseline y con el Filtro de Kalman para 3 configuraciones de hiperparámetros.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Variante} & \textbf{Accuracy} & \textbf{Recall} & \textbf{F1} & \textbf{MAE} & \textbf{MSE} \\
+\midrule
+Baseline (sin Kalman) & 0.9414 & 0.9325 & 0.9326 & 0.0593 & 0.0548 \\
+Kalman ($\sigma_w^2=10^{-5}, \sigma_v^2=10^{-1}$) & 0.9385 & 0.9199 & 0.9279 & 0.0835 & 0.0449 \\
+Kalman ($\sigma_w^2=10^{-3}, \sigma_v^2=10^{-2}$) & 0.9413 & 0.9307 & 0.9323 & 0.0640 & 0.0494 \\
+Kalman ($\sigma_w^2=10^{-1}, \sigma_v^2=10^{-3}$) & 0.9414 & 0.9324 & 0.9326 & 0.0594 & 0.0547 \\
+\bottomrule
+\end{tabular}
+\caption{Comparación de métricas entre el modelo baseline y variantes con filtro de Kalman.}
+\label{tab:resultados}
+\end{table}
+
+\subsection{Discusión}
+
+\textbf{¿Mejoró el Kalman las métricas?}\\
+El efecto del filtro de Kalman fue diferenciado según la métrica observada. En términos de clasificación estricta (Accuracy, Recall, F1), el Baseline sin Kalman obtuvo los mejores resultados globales (F1 = 0.9326). Sin embargo, al observar las métricas continuas de error, las configuraciones de Kalman lograron una reducción significativa del MSE (de 0.0548 en el Baseline a 0.0449 con $\sigma_w^2=10^{-5}$). Esto indica que el filtro efectivamente suavizó los picos de probabilidad más extremos (reduciendo el error cuadrático), pero al umbralar esta probabilidad suavizada en 0.5 para la clasificación binaria, algunas predicciones cercanas al umbral cambiaron de categoría incorrectamente, impactando levemente el F1.
+
+\textbf{Trade-off entre precisión y recall al aplicar Kalman:}\\
+Sí existe un trade-off evidente. En la configuración de suavizado agresivo ($\sigma_w^2=10^{-5}$), el Recall cayó de 0.9325 a 0.9199. Al forzar que el estado sea muy estable ($\sigma_w^2 \approx 0$), el filtro genera "inercia" sobre las probabilidades. Si el modelo predice un ataque repentino, el Kalman suaviza esa probabilidad hacia abajo, requiriendo más observaciones consecutivas para superar el umbral de 0.5. Esto incrementa los Falsos Negativos (ataques que la red detectó pero el filtro suavizó), reduciendo el Recall a cambio de una mayor Precisión en las predicciones que sí superan el umbral.
+
+\textbf{Limitaciones del modelo de Random Walk:}\\
+Asumir $s_{t+1} = s_t + w_t$ implica que la probabilidad subyacente de anomalía no tiene inercia direccional, solo cambia por un ruido blanco gaussiano. Esta hipótesis es limitante porque no puede modelar ataques cuyas probabilidades aumenten exponencialmente (como ataques DDoS en escalada) ni patrones cíclicos. Ataques de infiltración lenta o escaneos progresivos no son bien modelados por una caminata aleatoria estática, ya que su dinámica interna es determinista y acumulativa, no puramente estocástica.
+
+\textbf{Propuestas de mejora:}\\
+\begin{enumerate}
+    \item Añadir un término de control al filtro de Kalman (Kalman con entrada), modelando $s_{t+1} = F s_t + G u_t + w_t$, permitiendo que el estado de anomalía siga dinámicas aceleradas basadas en la magnitud de la entrada de red.
+    \item Reemplazar el mecanismo espectral basado en FFT por Wavelets (Transformada Wavelet Discreta), lo cual permite conservar información temporal localizada, ideal para ataques que ocurren en franjas horarias específicas sin ser estrictamente periódicos.
+    \item Implementar un umbral dinámico post-Kalman en lugar de un umbral fijo de 0.5. Dado que el filtro reduce la varianza de las predicciones, un umbral adaptativo basado en la varianza $P_{t|t}$ podría recuperar el Recall perdido sin sacrificar el suavizado del error.
+\end{enumerate}
+
+\end{document}
